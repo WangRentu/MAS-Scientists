@@ -1,21 +1,29 @@
 # evoverse/agents/town_orchestrator.py
 from __future__ import annotations
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import json
 import logging
 
 from evoverse.agents.scientist_agent import LLMScientistAgent
 from evoverse.core.llm_client import LLMClient, create_message
-from evoverse.config.settings import town_settings
+from evoverse.config import get_config
+from evoverse.core.domain_router import DomainRouter
 
 logger = logging.getLogger(__name__)
 
 
 class TownOrchestrator:
-    def __init__(self, scientists: List[LLMScientistAgent], llm: LLMClient):
+    def __init__(
+        self,
+        scientists: List[LLMScientistAgent],
+        llm: LLMClient,
+        domain_router: Optional[DomainRouter] = None,
+    ):
         self.scientists = scientists
         self.llm = llm
+        # 领域路由器：用于对整体科研问题做一次域分类与路由分析
+        self.domain_router = domain_router or DomainRouter(llm_client=llm)
         logger.info("Town orchestrator initialized with %d scientists", len(scientists))
 
     # -------------------- 单轮讨论 --------------------
@@ -122,9 +130,29 @@ class TownOrchestrator:
     def run_town_meeting(self, question: str) -> Dict[str, Any]:
         global_summary = ""
         history_rounds: List[Dict[str, Any]] = []
-        logger.info("Town meeting started | question=%s rounds=%d", question, town_settings.num_rounds)
+        town_cfg = get_config().town
+        logger.info("Town meeting started | question=%s rounds=%d", question, town_cfg.num_rounds)
 
-        for r in range(1, town_settings.num_rounds + 1):
+        # 在讨论开始前先对问题进行一次领域分类与路由分析
+        domain_classification = None
+        domain_routing = None
+        try:
+            if self.domain_router:
+                domain_classification = self.domain_router.classify_research_question(
+                    question
+                )
+                domain_routing = self.domain_router.route(
+                    question, classification=domain_classification
+                )
+                logger.info(
+                    "Domain routing attached | primary=%s multi=%s",
+                    domain_classification.primary_domain.value,
+                    domain_classification.is_multi_domain,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Domain routing failed, continuing without it: %s", exc)
+
+        for r in range(1, town_cfg.num_rounds + 1):
             result = self._run_single_round(question, r, global_summary)
             history_rounds.append(result)
             global_summary = result["summary"]
@@ -133,18 +161,18 @@ class TownOrchestrator:
             # 每轮结束后，看哪些 agent 声望太低要进化
             feedback_text = self._build_feedback_for_evolution(history_rounds)
             for sci in self.scientists:
-                if sci.cfg.reputation < town_settings.evolution_threshold:
+                if sci.cfg.reputation < town_cfg.evolution_threshold:
                     logger.warning(
                         "Scientist %s reputation %.2f below threshold %.2f, triggering evolution",
                         sci.cfg.name,
                         sci.cfg.reputation,
-                        town_settings.evolution_threshold,
+                        town_cfg.evolution_threshold,
                     )
                     sci.evolve(feedback_text)
 
         final_summary = self._final_summary(question, history_rounds)
 
-        return {
+        result: Dict[str, Any] = {
             "question": question,
             "rounds": history_rounds,
             "final_summary": final_summary,
@@ -159,6 +187,22 @@ class TownOrchestrator:
                 for s in self.scientists
             ],
         }
+
+        # 将领域分类与路由结果一并返回，方便上层系统记录与可视化
+        if domain_classification is not None:
+            try:
+                result["domain_classification"] = domain_classification.model_dump()
+            except AttributeError:
+                # 兼容 Pydantic v1
+                result["domain_classification"] = domain_classification.dict()
+
+        if domain_routing is not None:
+            try:
+                result["domain_routing"] = domain_routing.model_dump()
+            except AttributeError:
+                result["domain_routing"] = domain_routing.dict()
+
+        return result
 
     def _build_feedback_for_evolution(self, history_rounds: List[Dict[str, Any]]) -> str:
         # 只用最近两轮总结 + 评分做反馈
