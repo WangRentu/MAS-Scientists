@@ -311,7 +311,8 @@ class DomainRouter:
         domains_list = ", ".join([d.value for d in ScientificDomain])
 
         prompt = (
-            "Classify the following research question into one or more scientific domains.\n\n"
+            "Translate the question into English at first.\n\n"
+            "Then, Classify the following research question into one or more scientific domains.\n\n"
             "Research Question:\n"
             f"{question}\n\n"
         )

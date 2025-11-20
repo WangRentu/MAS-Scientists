@@ -98,6 +98,9 @@ class ScientificDomain(str, Enum):
     # Default / general
     GENERAL = "general"
 
+    MATERIALS = "materials"
+    ASTRONOMY = "astronomy"
+
 
 class DomainConfidence(str, Enum):
     """Confidence levels for domain classification."""

@@ -11,6 +11,14 @@ from evoverse.config import get_config
 from pydantic import BaseModel, Field
 from evoverse.agents.literature_agent import LiteratureAgent
 from evoverse.models.domain import ScientificDomain
+from evoverse.agents.memory import (
+    AgentMemory,
+    TaskEpisodeMemory,
+    SocialMemory,
+    MetaSelfMemory,
+    agent_memory_to_dict,
+    agent_memory_from_dict,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -35,8 +43,11 @@ class ScientistConfig(BaseModel):
     # 适应度 / 声誉（演化算法直接用这个）
     reputation: float = 0.5            # 0~1 初始值
 
-    # 长期记忆：可以先只放字符串，后面再换成结构化 memory 对象
+    # 简单字符串记忆：沿用原有实现，用于 prompt 中快速回顾最近几条经验
     memory: List[str] = Field(default_factory=list)
+
+    # 结构化长期记忆
+    agent_memory: AgentMemory = Field(default_factory=AgentMemory)
 
     # 可演化基因：用前面的 ScientistGenome 来承载
     genome: ScientistGenome
@@ -72,6 +83,113 @@ class LLMScientistAgent(BaseAgent):
 
     def domain(self) -> ScientificDomain:
         return self.cfg.genome.domain
+
+    # -------------------- 结构化记忆写入助手 --------------------
+
+    def add_task_episode_memory(
+        self,
+        task_id: str,
+        task_title: str,
+        task_domains: List[str],
+        outcome_score: float,
+        outcome_feedback: str = "",
+        key_decisions: Optional[List[str]] = None,
+        key_contributions: Optional[List[str]] = None,
+        self_reflection: str = "",
+    ) -> None:
+        """
+        记录一次任务级别的记忆。
+
+        目前在镇会议结束时由 orchestrator 调用：
+        - task_id: 可以是问题的 hash 或外部任务 ID
+        - task_title: 问题本身
+        - task_domains: 该任务涉及的领域列表（字符串形式）
+        - outcome_score: 通常可使用当前专家的 reputation 或任务总体评分
+        """
+        episode = TaskEpisodeMemory(
+            task_id=task_id,
+            task_title=task_title,
+            task_domains=task_domains,
+            task_embedding=[],  # 目前暂不计算 embedding，留空列表占位
+            role=self.cfg.role,
+            key_decisions=key_decisions or [],
+            key_contributions=key_contributions or [],
+            outcome_score=outcome_score,
+            outcome_feedback=outcome_feedback,
+            self_reflection=self_reflection,
+        )
+        self.cfg.agent_memory.episodes.append(episode)
+
+    def update_social_memory(self, collaborator_id: str, score: float) -> None:
+        """
+        根据一次合作/互评更新社会记忆。
+
+        在 TownOrchestrator 中，每次互评时可以调用：
+            critic.update_social_memory(target_name, score)
+        """
+        social_list = self.cfg.agent_memory.social
+        for sm in social_list:
+            if sm.collaborator_id == collaborator_id:
+                # 更新聚合统计
+                total = sm.avg_outcome_score * sm.num_projects + score
+                sm.num_projects += 1
+                sm.avg_outcome_score = total / sm.num_projects
+                sm.last_collab_time = sm.last_collab_time.__class__.utcnow()
+                return
+
+        social_list.append(
+            SocialMemory(
+                collaborator_id=collaborator_id,
+                num_projects=1,
+                avg_outcome_score=score,
+                notes="",
+            )
+        )
+
+    def append_meta_strategy_update(self, note: str) -> None:
+        """
+        在专家发生明显演化（例如触发 evolve）时，追加一条策略演化记录。
+        """
+        if self.cfg.agent_memory.meta is None:
+            self.cfg.agent_memory.meta = MetaSelfMemory(
+                strengths=[],
+                weaknesses=[],
+                typical_failures=[],
+                strategy_updates=[],
+            )
+        meta = self.cfg.agent_memory.meta
+        meta.strategy_updates.append(note)
+        meta.last_updated = meta.last_updated.__class__.utcnow()
+
+    # ========================================================================
+    # STATE PERSISTENCE (deep integration with BaseAgent)
+    # ========================================================================
+
+    def get_state(self):  # type: ignore[override]
+        """
+        将结构化记忆持久化到 BaseAgent.state_data 中，然后调用基类的 get_state。
+
+        这样，上层只要拿到 AgentState 并做磁盘序列化，就自动包含了专家的记忆。
+        """
+        # 先把当前 AgentMemory 序列化进 state_data
+        self.save_state_data("agent_memory", agent_memory_to_dict(self.cfg.agent_memory))
+        return super().get_state()
+
+    def restore_state(self, state):  # type: ignore[override]
+        """
+        从 AgentState 中恢复 BaseAgent 状态，并尝试反序列化结构化记忆。
+        """
+        super().restore_state(state)
+        mem_dict = self.get_state_data("agent_memory")
+        if isinstance(mem_dict, dict):
+            try:
+                self.cfg.agent_memory = agent_memory_from_dict(mem_dict)
+            except Exception:
+                logger.warning(
+                    "Failed to restore agent_memory for %s from state_data",
+                    self.cfg.name,
+                    exc_info=True,
+                )
 
     # -------------------- 内部：system prompt --------------------
 
@@ -349,6 +467,10 @@ class LLMScientistAgent(BaseAgent):
                     setattr(self.cfg.genome, field_name, value)
             # 进化之后把声望拉回中性
             self.cfg.reputation = 0.5
+            # 记录一次策略演化
+            self.append_meta_strategy_update(
+                f"Evolution triggered due to low reputation; feedback summary length={len(feedback_summary)}."
+            )
             logger.info(
                 "Scientist %s evolved | new_expertise=%s new_worldview=%s",
                 self.cfg.name,
